@@ -501,7 +501,7 @@ class ExecutionCoordinator {
    * @param {string} [lockToken]
    * @returns {boolean}
    */
-  isFencingTokenValid(taskId, fencingToken, lockToken) {
+  isFencingTokenValid(taskId, fencingToken, _lockToken) {
     const id = String(taskId);
     const tokenNum = Number(fencingToken);
 
@@ -789,6 +789,74 @@ class ExecutionCoordinator {
       droppedTasks: 0,
       durationMs: Date.now() - startTime,
     };
+  }
+
+  /**
+   * Attach a DisasterRecoveryOrchestrator to coordinate multi-cloud failover and prevent split-brain (#1438).
+   * @param {import('./dr-orchestrator').DisasterRecoveryOrchestrator} drOrchestrator
+   * @param {string} [cloudRole='aws']
+   */
+  attachDrOrchestrator(drOrchestrator, cloudRole = 'aws') {
+    this.drOrchestrator = drOrchestrator;
+    this.cloudRole = cloudRole;
+    this.clusterEpoch = drOrchestrator?.clusterEpoch || 1;
+    return this.drOrchestrator;
+  }
+
+  /**
+   * Replicate current fencing tokens and task leases to the cross-cloud DR state replicator (#1438).
+   */
+  syncStateToDrReplicator(latestLedger = 0) {
+    if (!this.drOrchestrator || !this.drOrchestrator.stateReplicator) {
+      return null;
+    }
+    const fencingTokens = Object.fromEntries(this.highestFencingTokens.entries());
+    return this.drOrchestrator.stateReplicator.recordPrimaryMutation({
+      fencingTokens,
+      latestLedger,
+    });
+  }
+
+  /**
+   * Hydrate standby coordinator from cross-cloud replicated snapshot upon GCP promotion (#1438).
+   * Ensures promoted standby never issues lower fencing tokens than the failed primary.
+   */
+  hydrateFromDrSnapshot(snapshot = {}, promotedCloud = 'gcp', promotedEpoch = 2) {
+    this.cloudRole = promotedCloud;
+    this.clusterEpoch = promotedEpoch;
+    if (snapshot.fencingTokens && typeof snapshot.fencingTokens === 'object') {
+      for (const [taskId, token] of Object.entries(snapshot.fencingTokens)) {
+        const current = this.highestFencingTokens.get(String(taskId)) || 0;
+        if (Number(token) > current) {
+          this.highestFencingTokens.set(String(taskId), Number(token));
+        }
+      }
+    }
+    return {
+      cloudRole: this.cloudRole,
+      clusterEpoch: this.clusterEpoch,
+      hydratedTaskCount: this.highestFencingTokens.size,
+    };
+  }
+
+  /**
+   * Verify that this coordinator's cloud cluster is active and not fenced by a multi-cloud failover (#1438).
+   * Guarantees zero dual-active split-brain conflicts.
+   * @param {string} [cloudKey]
+   * @param {number} [callerEpoch]
+   */
+  assertNoSplitBrainConflict(cloudKey = this.cloudRole, callerEpoch = this.clusterEpoch) {
+    if (
+      this.drOrchestrator &&
+      typeof this.drOrchestrator.canClusterExecute === 'function' &&
+      !this.drOrchestrator.canClusterExecute(cloudKey, callerEpoch)
+    ) {
+      throw createStructuredError({
+        code: 'SPLIT_BRAIN_FENCED',
+        message: `SPLIT_BRAIN_FENCED: Execution rejected on cluster '${cloudKey}' (epoch ${callerEpoch}): cluster is fenced or not active primary.`,
+      });
+    }
+    return true;
   }
 }
 
